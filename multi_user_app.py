@@ -1,0 +1,736 @@
+from pathlib import Path
+from collections import deque
+
+import joblib
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import requests
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+API_URL = "http://127.0.0.1:8000"
+ROOT = Path(__file__).resolve().parent
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+.stApp { background: #080d17; color: #e5ebf5; }
+[data-testid="stSidebar"] { background: #0b1220; border-right: 1px solid #1d293b; }
+[data-testid="stMetric"] { background: linear-gradient(145deg,#111b2b,#0d1522); border: 1px solid #1e2b3e; border-radius: 13px; padding: 17px 19px; }
+[data-testid="stMetricLabel"] { color: #9aa9bd; }
+[data-testid="stMetricValue"] { color: #f3f6fb; }
+div[data-testid="stVerticalBlockBorderWrapper"] { border-color: #1c293b; }
+h1,h2,h3 { letter-spacing: -.02em; }
+.eyebrow { color:#57a6ff; font-size:12px; text-transform:uppercase; letter-spacing:.12em; font-weight:700; }
+.muted { color:#91a0b5; }
+button[kind="primary"] { background:#2868db; }
+</style>
+""", unsafe_allow_html=True)
+
+
+
+
+@st.cache_resource
+def load_artifacts():
+    paths = {
+        "Random Forest": ROOT / "random_forest_model.pkl",
+        "Isolation Forest": ROOT / "isolation_forest_model.pkl",
+        "Preprocessor": ROOT / "preprocessor.pkl",
+    }
+    missing = [name for name, path in paths.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Missing artifact(s): " + ", ".join(missing))
+    return joblib.load(paths["Random Forest"]), joblib.load(paths["Isolation Forest"]), joblib.load(paths["Preprocessor"])
+
+
+def prepare_features(frame, preprocessor):
+    """Separate known ground-truth columns before transforming model features."""
+    data = frame.copy()
+    by_normalized = {str(c).strip().lower(): c for c in data.columns}
+    label_col = by_normalized.get("label")
+    attack_col = by_normalized.get("attack_cat")
+    actual = data[label_col].copy() if label_col is not None else None
+    data = data.drop(columns=[c for c in (label_col, attack_col) if c is not None], errors="ignore")
+
+    expected = getattr(preprocessor, "feature_names_in_", None)
+    if expected is not None:
+        expected = list(expected)
+        leaked = [c for c in expected if str(c).strip().lower() in {"label", "attack_cat"}]
+        if leaked:
+            raise ValueError("The saved preprocessor expects target/label columns as features (" + ", ".join(map(str, leaked)) + "). Retrain it without labels to prevent leakage.")
+        missing = [c for c in expected if c not in data.columns]
+        if missing:
+            raise ValueError("Missing model feature columns: " + ", ".join(map(str, missing[:12])) + (" …" if len(missing) > 12 else ""))
+        data = data.loc[:, expected]
+    elif hasattr(preprocessor, "n_features_in_") and data.shape[1] != preprocessor.n_features_in_:
+        raise ValueError(f"Preprocessor expects {preprocessor.n_features_in_} feature columns; found {data.shape[1]} after label removal.")
+    return data, actual
+
+
+def binary_label(value):
+    val = str(value).strip().lower()
+    if val in {"0", "0.0", "normal", "benign", "false"}:
+        return "Normal"
+    if val in {"1", "1.0", "attack", "malicious", "true"}:
+        return "Attack"
+    return None
+
+
+def section_header(title, subtitle=None):
+    st.markdown(f'<div class="eyebrow">Network security monitor</div><h1 style="margin:4px 0 0">{title}</h1>', unsafe_allow_html=True)
+    if subtitle:
+        st.markdown(f'<p class="muted" style="margin-top:4px">{subtitle}</p>', unsafe_allow_html=True)
+
+
+try:
+    rf_model, iso_model, preprocessor = load_artifacts()
+    model_ready = True
+except Exception as exc:
+    model_ready = False
+    load_error = str(exc)
+
+def api_headers():
+    return {
+        "Authorization": f"Bearer {st.session_state.token}"
+    }
+
+
+
+# LOGIN AND REGISTRATION
+
+if "token" not in st.session_state:
+    st.session_state.token = None
+
+if not st.session_state.token:
+
+    st.title("🛡️ NIDS Network Security")
+
+    mode = st.radio(
+        "Choose an option",
+        ["Login", "Create Account"],
+        horizontal=True
+    )
+
+    if mode == "Create Account":
+
+        st.subheader("Create Your Account")
+
+        with st.form("register_form"):
+            username = st.text_input("Username")
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            confirm = st.text_input("Confirm Password", type="password")
+
+            submitted = st.form_submit_button("Register")
+
+        if submitted:
+            if not username or not email or not password:
+                st.error("Please fill all fields.")
+            elif password != confirm:
+                st.error("Passwords do not match.")
+            else:
+                try:
+                    response = requests.post(
+                        f"{API_URL}/register",
+                        json={
+                            "username": username,
+                            "email": email,
+                            "password": password
+                        },
+                        timeout=10
+                    )
+
+                    if response.status_code in (200, 201):
+                        st.success("Account created successfully!")
+
+                        login_response = requests.post(
+                            f"{API_URL}/login",
+                            json={
+                                "email": email,
+                                "password": password
+                            },
+                            timeout=10
+                        )
+
+                        if login_response.status_code == 200:
+                            st.session_state.token = login_response.json()["access_token"]
+                            st.rerun()
+                        else:
+                            st.warning("Account created. Please login manually.")
+                    else:
+                        st.error(response.text)
+
+                except requests.RequestException:
+                    st.error("Backend is not reachable.")
+
+    else:
+
+        st.subheader("Welcome Back")
+
+        with st.form("login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login")
+
+        if submitted:
+            try:
+                response = requests.post(
+                    f"{API_URL}/login",
+                    json={"email": email, "password": password},
+                    timeout=10
+                )
+
+                if response.status_code == 200:
+                    st.session_state.token = response.json()["access_token"]
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password.")
+
+            except requests.RequestException:
+                st.error("Backend is not reachable.")
+
+    st.stop()
+
+
+
+
+with st.sidebar:
+    st.markdown("## 🛡️ NIDS")
+    st.caption("Authenticated network security monitor")
+    if st.button("Logout"):
+        st.session_state.token = None
+        st.rerun()
+
+    st.divider()
+    page = st.radio(
+        "Navigation",
+        [
+            "User Monitor",
+            "Dashboard",
+            "Alerts",
+            "Traffic Monitor",
+            "Analysis",
+            "Reports",
+            "Zeek Flow Demo",
+            "Live Monitoring",
+        ],
+        key="main_navigation",
+    )
+    st.divider()
+    st.markdown("**Data source**")
+    st.caption("User flows, uploaded CSV, saved Zeek logs, or live Zeek capture")
+    uploaded = st.file_uploader(
+        "Upload traffic CSV",
+        type=["csv"],
+        key="traffic_csv_upload",
+        help="Used by Dashboard, Alerts, Traffic Monitor, Analysis, and Reports.",
+    )
+
+
+if page == "User Monitor":
+    section_header(
+        "User-specific network monitor",
+        "Authenticated device and flow records stored by the NIDS backend",
+    )
+    try:
+        devices_response = requests.get(
+            f"{API_URL}/devices", headers=api_headers(), timeout=10
+        )
+        devices_response.raise_for_status()
+        devices = devices_response.json()
+    except requests.RequestException as exc:
+        st.error(f"Could not load your devices: {exc}")
+        st.stop()
+
+    if not devices:
+        st.warning("No registered devices found for this account.")
+        st.subheader("Register your device")
+        with st.form("device_register_form"):
+            device_name = st.text_input("Device name", "My Laptop")
+            hostname = st.text_input("Hostname", "localhost")
+            operating_system = st.text_input("Operating system", "Windows 11")
+            register_device = st.form_submit_button("Register device")
+        if register_device:
+            try:
+                response = requests.post(
+                    f"{API_URL}/devices/register",
+                    headers=api_headers(),
+                    json={
+                        "device_name": device_name,
+                        "hostname": hostname,
+                        "operating_system": operating_system,
+                    },
+                    timeout=10,
+                )
+                if response.status_code in (200, 201):
+                    st.success("Device registered successfully.")
+                    st.rerun()
+                else:
+                    st.error(response.text)
+            except requests.RequestException as exc:
+                st.error(f"Could not register device: {exc}")
+        st.stop()
+
+    device_options = {
+        f"{item['device_name']} (ID: {item['id']})": item["id"]
+        for item in devices
+    }
+    selected_device_label = st.selectbox(
+        "Select your device", list(device_options.keys())
+    )
+    selected_device_id = device_options[selected_device_label]
+
+    try:
+        flows_response = requests.get(
+            f"{API_URL}/my-flows", headers=api_headers(), timeout=15
+        )
+        flows_response.raise_for_status()
+        flows = flows_response.json()
+    except requests.RequestException as exc:
+        st.error(
+            f"Could not load flow records: {exc}. "
+            "Check that the backend is running and the /my-flows endpoint exists."
+        )
+        st.stop()
+
+    user_df = pd.DataFrame(flows)
+    if user_df.empty:
+        user_df = pd.DataFrame(
+            columns=[
+                "device_id", "prediction", "anomaly_score",
+                "source_ip", "destination_ip", "protocol", "created_at",
+            ]
+        )
+    user_df = user_df[user_df["device_id"] == selected_device_id].copy()
+    total_flows = len(user_df)
+    unusual_flows = int((user_df["prediction"] == "UNUSUAL").sum())
+    baseline_flows = int((user_df["prediction"] == "BASELINE").sum())
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total flows", total_flows)
+    m2.metric("Unusual flows", unusual_flows)
+    m3.metric("Baseline flows", baseline_flows)
+    st.warning(
+        "UNUSUAL is an AI anomaly flag, not confirmation of a cyberattack."
+    )
+
+    chart_left, chart_right = st.columns(2)
+    with chart_left:
+        st.subheader("Traffic classification")
+        if total_flows:
+            chart_df = pd.DataFrame({
+                "Prediction": ["BASELINE", "UNUSUAL"],
+                "Count": [baseline_flows, unusual_flows],
+            })
+            fig = px.pie(
+                chart_df, names="Prediction", values="Count", hole=0.55
+            )
+            fig.update_layout(template="plotly_dark")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No flow records are available for this device yet.")
+    with chart_right:
+        st.subheader("Anomaly score distribution")
+        if total_flows and "anomaly_score" in user_df.columns:
+            fig = px.histogram(
+                user_df, x="anomaly_score", color="prediction", nbins=25
+            )
+            fig.update_layout(template="plotly_dark")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No anomaly scores are available yet.")
+
+    st.subheader("Recent unusual flows")
+    if total_flows:
+        alerts_df = user_df[user_df["prediction"] == "UNUSUAL"]
+        if "id" in alerts_df.columns:
+            alerts_df = alerts_df.sort_values("id", ascending=False)
+        st.dataframe(alerts_df.head(50), use_container_width=True, hide_index=True)
+        st.subheader("Recent network traffic")
+        recent_df = user_df.sort_values("id", ascending=False) if "id" in user_df.columns else user_df
+        st.dataframe(recent_df.head(100), use_container_width=True, hide_index=True)
+    else:
+        st.info("Your device is registered, but no flow records have arrived yet.")
+    if st.button("Refresh user flow data"):
+        st.rerun()
+    st.stop()
+
+st.markdown(
+    '<div class="eyebrow">Network security analysis prototype</div>',
+    unsafe_allow_html=True,
+)
+
+if page == "Zeek Flow Demo":
+    st.caption(
+        "Analyze a saved Zeek flow TSV. This is a saved-capture demo, not a continuous live feed."
+    )
+elif page == "Live Monitoring":
+    st.caption(
+        "Reads Zeek conn.log written by the WSL capture process. It only covers traffic visible to the WSL interface."
+    )
+else:
+    st.caption("Predictions are generated from the uploaded traffic CSV.")
+
+if page == "Zeek Flow Demo":
+    section_header(
+        "Zeek flow anomaly demo",
+        "Score flows from a saved capture using the separate Zeek-trained model",
+    )
+    zeek_model_path = ROOT / "zeek_anomaly_model.pkl"
+    if not zeek_model_path.is_file():
+        st.error(
+            "zeek_anomaly_model.pkl is missing. Place the Zeek model beside app.py."
+        )
+        st.stop()
+
+    try:
+        zeek_artifact = joblib.load(zeek_model_path)
+        zeek_detector = zeek_artifact["pipeline"]
+        zeek_features = list(zeek_artifact["features"])
+    except Exception as exc:
+        st.error(f"Could not load the Zeek anomaly model: {exc}")
+        st.info("This usually means the model was saved with a different scikit-learn version. Use the same version used for training, or retrain the Zeek model in this app environment.")
+        st.stop()
+
+    zeek_file = st.file_uploader(
+        "Upload Zeek flow TSV",
+        type=["tsv", "txt"],
+        key="zeek_flow_upload",
+    )
+    st.caption(
+        "Use a TSV exported with the same Zeek feature columns. This file contains flow metrics, not packet contents."
+    )
+    if zeek_file is None:
+        st.info("Upload a Zeek TSV to see which flows this experimental model considers unusual.")
+        st.stop()
+
+    zeek_columns = [
+        "duration",
+        "orig_pkts",
+        "resp_pkts",
+        "orig_bytes",
+        "resp_bytes",
+        "orig_ip_bytes",
+        "resp_ip_bytes",
+    ]
+    try:
+        zeek_data = pd.read_csv(
+            zeek_file,
+            sep="\\t",
+            header=None,
+            names=zeek_columns,
+            na_values=["-"],
+        )
+        for column in zeek_columns:
+            zeek_data[column] = pd.to_numeric(zeek_data[column], errors="coerce")
+
+        missing_features = [
+            column for column in zeek_features if column not in zeek_data.columns
+        ]
+        if missing_features:
+            raise ValueError(
+                "TSV is missing model feature columns: "
+                + ", ".join(missing_features)
+            )
+
+        usable = zeek_data[zeek_features].replace([np.inf, -np.inf], np.nan)
+        predictions = zeek_detector.predict(usable)
+    except Exception as exc:
+        st.error(f"Could not score this Zeek TSV: {exc}")
+        st.caption(
+            "Check that the file was exported with the same feature names and order used to train the Zeek model."
+        )
+        st.stop()
+
+    zeek_results = zeek_data.copy()
+    zeek_results["Anomaly status"] = [
+        "Unusual flow" if value == -1 else "Baseline-like"
+        for value in predictions
+    ]
+    zeek_results["Model score"] = zeek_detector.decision_function(usable)
+    unusual = int((predictions == -1).sum())
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Flows analyzed", f"{len(zeek_results):,}")
+    k2.metric("Unusual flows", f"{unusual:,}")
+    k3.metric("Baseline-like flows", f"{len(zeek_results) - unusual:,}")
+
+    st.warning(
+        "‘Unusual flow’ is an anomaly flag, not a confirmed attack. This page scores a saved capture, not live traffic."
+    )
+    st.subheader("Flagged flows")
+    flagged_zeek = zeek_results[
+        zeek_results["Anomaly status"] == "Unusual flow"
+    ].sort_values("Model score")
+    # HTML rendering avoids the PyArrow dataframe dependency on affected Windows systems.
+    st.markdown(
+        flagged_zeek.head(100).to_html(
+            index=False, escape=True, classes="nids-table"
+        ),
+        unsafe_allow_html=True,
+    )
+    zeek_csv = zeek_results.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Download Zeek flow analysis (CSV)",
+        data=zeek_csv,
+        file_name="zeek_flow_anomaly_results.csv",
+        mime="text/csv",
+    )
+    st.stop()
+
+if page == "Live Monitoring":
+    section_header(
+        "Live Network Monitoring",
+        "Monitor Zeek connection records and score flows with the Zeek anomaly model",
+    )
+
+    live_log = ROOT / "zeek-live" / "live" / "conn.log"
+    live_model_path = ROOT / "zeek_anomaly_model.pkl"
+
+    if not live_log.is_file():
+        st.error(f"Zeek log not found: {live_log}")
+        st.info(
+            "Start Zeek in Ubuntu WSL and configure its log directory to the project's zeek-live folder."
+        )
+        st.stop()
+
+    if not live_model_path.is_file():
+        st.error(f"Zeek anomaly model not found: {live_model_path}")
+        st.stop()
+
+    st.button("Refresh live data")
+    st.caption(
+        "Use the refresh button to reload the latest log records. Keep the Zeek capture terminal running while monitoring."
+    )
+
+    try:
+        zeek_artifact = joblib.load(live_model_path)
+        live_detector = zeek_artifact["pipeline"]
+        live_features = list(zeek_artifact["features"])
+
+        fields = None
+        recent_rows = deque(maxlen=5000)
+
+        with live_log.open("r", encoding="utf-8", errors="replace") as log_file:
+            for line in log_file:
+                if line.startswith("#fields"):
+                    fields = line.rstrip("\r\n").split("\t")[1:]
+                elif line.startswith("#") or not line.strip():
+                    continue
+                elif fields is not None:
+                    values = line.rstrip("\r\n").split("\t")
+                    if len(values) == len(fields):
+                        recent_rows.append(values)
+
+        if not fields:
+            st.warning("Zeek has not written a #fields header to conn.log yet.")
+            st.stop()
+
+        if not recent_rows:
+            st.info("Waiting for Zeek connection records. Generate ordinary network activity and refresh this page.")
+            st.stop()
+
+        live_data = pd.DataFrame(list(recent_rows), columns=fields)
+        missing_features = [
+            column for column in live_features if column not in live_data.columns
+        ]
+        if missing_features:
+            st.error(
+                "The current conn.log is missing model features: "
+                + ", ".join(missing_features)
+            )
+            st.caption(
+                "The Zeek conn.log fields must include the feature names used when training zeek_anomaly_model.pkl."
+            )
+            st.stop()
+
+        for column in live_features:
+            live_data[column] = pd.to_numeric(
+                live_data[column].replace("-", np.nan), errors="coerce"
+            )
+
+        usable = live_data[live_features].replace([np.inf, -np.inf], np.nan)
+        predictions = live_detector.predict(usable)
+        live_data["Anomaly Status"] = [
+            "Unusual flow" if value == -1 else "Baseline-like"
+            for value in predictions
+        ]
+        live_data["Model score"] = live_detector.decision_function(usable)
+
+        unusual_count = int((predictions == -1).sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Flows analyzed", f"{len(live_data):,}")
+        c2.metric("Unusual flows", f"{unusual_count:,}")
+        c3.metric(
+            "Baseline-like flows", f"{len(live_data) - unusual_count:,}"
+        )
+
+        st.warning(
+            "Anomaly flags indicate unusual traffic, not confirmed attacks. "
+            "This view only covers traffic visible to the WSL Zeek interface."
+        )
+
+        st.subheader("Recent network flows")
+        st.markdown(
+            live_data.tail(100).to_html(
+                index=False, escape=True, classes="nids-table"
+            ),
+            unsafe_allow_html=True,
+        )
+
+        flagged_live = live_data[
+            live_data["Anomaly Status"] == "Unusual flow"
+        ].sort_values("Model score")
+        st.subheader("Unusual flows")
+        st.markdown(
+            flagged_live.head(100).to_html(
+                index=False, escape=True, classes="nids-table"
+            ),
+            unsafe_allow_html=True,
+        )
+
+        live_csv = live_data.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Download live flow analysis (CSV)",
+            data=live_csv,
+            file_name="zeek_live_flow_analysis.csv",
+            mime="text/csv",
+        )
+    except Exception as exc:
+        st.error(f"Live monitoring error: {exc}")
+        if "SimpleImputer" in str(exc) or "_fill_dtype" in str(exc):
+            st.info("The Zeek model was saved with a different scikit-learn version. Retrain zeek_anomaly_model.pkl using the same Python environment that runs Streamlit.")
+
+    st.stop()
+
+# The Zeek pages use their own model. The Random Forest and Isolation Forest
+# artifacts are required only for the CSV-analysis pages below.
+if not model_ready:
+    st.error(f"Could not load CSV model artifacts: {load_error}")
+    st.info("The CSV models may have been saved with a different scikit-learn version. Use the original training environment or retrain the models; do not patch pickle internals.")
+    st.info(
+        "Place random_forest_model.pkl, isolation_forest_model.pkl, and preprocessor.pkl beside app.py."
+    )
+    st.stop()
+
+if uploaded is None:
+    section_header("Network Intrusion Detection System", "Upload a traffic CSV to inspect predictions, anomalies, and trusted evaluation metrics.")
+    st.info("Start by uploading a CSV with the same feature columns used to train the models.")
+    st.stop()
+
+try:
+    raw = pd.read_csv(uploaded)
+    if raw.empty:
+        st.warning("This CSV has no data rows.")
+        st.stop()
+    features, actual = prepare_features(raw, preprocessor)
+    transformed = preprocessor.transform(features)
+    rf_pred = rf_model.predict(transformed)
+    iso_pred = iso_model.predict(transformed)
+except Exception as exc:
+    st.error(f"Could not analyze this CSV: {exc}")
+    st.caption("Check that it contains the model's feature columns and compatible values.")
+    st.stop()
+
+results = raw.copy()
+results["Random Forest prediction"] = ["Attack" if str(v).strip().lower() in {"1", "1.0", "attack", "true"} else "Normal" for v in rf_pred]
+results["Isolation Forest"] = ["Anomaly" if v == -1 else "Normal" for v in iso_pred]
+results["Row"] = range(1, len(results) + 1)
+if actual is not None:
+    results["Trusted label"] = actual.map(binary_label)
+
+with st.sidebar:
+    st.divider()
+    st.markdown("**Filter results**")
+    traffic_types = st.multiselect("RF classification", ["Normal", "Attack"], default=["Normal", "Attack"])
+    anomaly_types = st.multiselect("Anomaly flag", ["Normal", "Anomaly"], default=["Normal", "Anomaly"])
+    max_rows = st.slider("Rows in table", 1, min(1000, len(results)), min(100, len(results)), step=10 if len(results) >= 10 else 1)
+
+filtered = results[results["Random Forest prediction"].isin(traffic_types) & results["Isolation Forest"].isin(anomaly_types)]
+total = len(results)
+attack_n = int((results["Random Forest prediction"] == "Attack").sum())
+anomaly_n = int((results["Isolation Forest"] == "Anomaly").sum())
+normal_n = total - attack_n
+
+if page == "Dashboard":
+    section_header("Security overview", f"Analysis of {total:,} uploaded traffic records")
+    a,b,c,d = st.columns(4)
+    a.metric("Traffic records", f"{total:,}")
+    b.metric("Predicted normal", f"{normal_n:,}")
+    c.metric("Predicted attacks", f"{attack_n:,}")
+    d.metric("Flagged anomalies", f"{anomaly_n:,}")
+    left, right = st.columns([1.55, 1])
+    trend = results.groupby("Row", as_index=False).agg(Attacks=("Random Forest prediction", lambda s: int((s == "Attack").sum())), Anomalies=("Isolation Forest", lambda s: int((s == "Anomaly").sum())))
+    with left:
+        st.subheader("Traffic overview")
+        st.caption("Counts by row order in the uploaded file")
+        if total > 1:
+            trend["Window"] = ((trend["Row"] - 1) // max(1, total // 50) + 1)
+            grouped = trend.groupby("Window", as_index=False)[["Attacks", "Anomalies"]].sum()
+            long = grouped.melt("Window", var_name="Signal", value_name="Records")
+            fig = px.line(long, x="Window", y="Records", color="Signal", color_discrete_map={"Attacks":"#ff5c70", "Anomalies":"#f5a524"}, markers=True)
+            fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=0,r=0,t=15,b=0), legend_title_text="")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("At least two records are needed to show a trend.")
+    with right:
+        st.subheader("Attack and anomaly distribution")
+        dist = pd.DataFrame({"Category":["Normal", "Attack", "Anomaly"], "Records":[normal_n, attack_n, anomaly_n]})
+        fig = px.pie(dist, names="Category", values="Records", hole=.62, color="Category", color_discrete_map={"Normal":"#3478f6", "Attack":"#f05263", "Anomaly":"#f5a524"})
+        fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", margin=dict(l=0,r=0,t=5,b=0), legend_title_text="")
+        st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Recent flagged records")
+    flagged = filtered[(filtered["Random Forest prediction"] == "Attack") | (filtered["Isolation Forest"] == "Anomaly")]
+    st.dataframe(flagged.tail(8).iloc[::-1], use_container_width=True, hide_index=True)
+
+elif page == "Alerts":
+    section_header("Security alerts", "Rows flagged by either model in the uploaded CSV")
+    flagged = filtered[(filtered["Random Forest prediction"] == "Attack") | (filtered["Isolation Forest"] == "Anomaly")]
+    st.metric("Flagged rows in current filter", f"{len(flagged):,}")
+    st.dataframe(flagged.iloc[::-1].head(max_rows), use_container_width=True, hide_index=True)
+
+elif page == "Traffic Monitor":
+    section_header("Traffic monitor", "Explore model predictions in CSV row order")
+    st.caption("This view analyzes the uploaded file; it does not receive live packets.")
+    st.dataframe(filtered.head(max_rows), use_container_width=True, hide_index=True)
+
+elif page == "Analysis":
+    section_header("Model analysis", "Prediction breakdown and evaluation against trusted labels")
+    left,right = st.columns(2)
+    with left:
+        st.subheader("Random Forest")
+        st.bar_chart(results["Random Forest prediction"].value_counts())
+    with right:
+        st.subheader("Isolation Forest")
+        st.bar_chart(results["Isolation Forest"].value_counts())
+    if actual is not None:
+        valid = results["Trusted label"].notna()
+        if valid.any():
+            truth = results.loc[valid, "Trusted label"]
+            predicted = results.loc[valid, "Random Forest prediction"]
+            report = classification_report(truth, predicted, labels=["Normal", "Attack"], output_dict=True, zero_division=0)
+            m1,m2,m3 = st.columns(3)
+            m1.metric("Accuracy", f"{accuracy_score(truth, predicted):.1%}")
+            m2.metric("Attack precision", f"{report['Attack']['precision']:.1%}")
+            m3.metric("Attack recall", f"{report['Attack']['recall']:.1%}")
+            st.caption("Scores are shown only for recognized values in the CSV's label column. Trust them only when labels are ground truth not used as model inputs.")
+            st.write("Confusion matrix · rows actual, columns predicted")
+            st.dataframe(pd.DataFrame(confusion_matrix(truth,predicted,labels=["Normal","Attack"]), index=["Actual Normal","Actual Attack"], columns=["Predicted Normal","Predicted Attack"]), use_container_width=True)
+        else:
+            st.warning("A label column exists, but no values match recognized Normal/Attack labels; evaluation is skipped.")
+    else:
+        st.info("No label column found. Evaluation metrics need trusted ground-truth labels; predictions still work.")
+    st.caption("Isolation Forest: -1 means anomaly and 1 means normal. An anomaly flag is not proof of an attack.")
+
+else:
+    section_header("Reports", "Export predictions for the currently selected filters")
+    st.metric("Rows included in report", f"{len(filtered):,}")
+    st.dataframe(filtered.head(25), use_container_width=True, hide_index=True)
+    report_csv = filtered.drop(columns=["Row"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
+    st.download_button("Download filtered report (CSV)", data=report_csv, file_name="nids_security_report.csv", mime="text/csv", type="primary")
+
+st.divider()
+st.caption("Random Forest and Isolation Forest predictions are model outputs. This dashboard is CSV-based, and does not report fabricated blocked attacks, CPU usage, or active connections.")

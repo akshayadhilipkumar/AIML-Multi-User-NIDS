@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv312/
+venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Database and private data
+*.db
+*.sqlite
+*.sqlite3
+
+# Zeek logs
+zeek-live/
+*.log
+
+# Large model - upload separately later
+random_forest_model.pkl
+
+# Temporary files
+.DS_Store
+.vscode/
