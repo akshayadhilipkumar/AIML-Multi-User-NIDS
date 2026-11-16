@@ -10,7 +10,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-API_URL = "http://127.0.0.1:8000"
+API_URL = "https://aiml-multi-user-nids-1.onrender.com"
 ROOT = Path(__file__).resolve().parent
 
 st.markdown("""
