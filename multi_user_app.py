@@ -32,18 +32,33 @@ button[kind="primary"] { background:#2868db; }
 
 
 
-
 @st.cache_resource
 def load_artifacts():
-    paths = {
-        "Random Forest": ROOT / "random_forest_model.pkl",
-        "Isolation Forest": ROOT / "isolation_forest_model.pkl",
-        "Preprocessor": ROOT / "preprocessor.pkl",
-    }
-    missing = [name for name, path in paths.items() if not path.is_file()]
+    import urllib.request
+
+    model_path = ROOT / "random_forest_model.pkl"
+    model_url = "https://huggingface.co/akshayadhilipkumar/nids-random-forest-model/resolve/main/random_forest_model.pkl"
+
+    if not model_path.exists():
+        urllib.request.urlretrieve(model_url, model_path)
+
+    isolation_path = ROOT / "isolation_forest_model.pkl"
+    preprocessor_path = ROOT / "preprocessor.pkl"
+
+    missing = [
+        str(p) for p in [isolation_path, preprocessor_path]
+        if not p.exists()
+    ]
+
     if missing:
-        raise FileNotFoundError("Missing artifact(s): " + ", ".join(missing))
-    return joblib.load(paths["Random Forest"]), joblib.load(paths["Isolation Forest"]), joblib.load(paths["Preprocessor"])
+        raise FileNotFoundError("Missing artifacts: " + ", ".join(missing))
+
+    return (
+        joblib.load(model_path),
+        joblib.load(isolation_path),
+        joblib.load(preprocessor_path)
+    )
+
 
 
 def prepare_features(frame, preprocessor):
