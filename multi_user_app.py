@@ -37,7 +37,7 @@ def load_artifacts():
     import urllib.request
 
     model_path = ROOT / "random_forest_model.pkl"
-    model_url = "https://huggingface.co/akshayadhilipkumar/nids-random-forest-model/resolve/main/random_forest_model.pkl"
+    model_url = "https://huggingface.co/akshayaaa06/nids-random-forest-model/resolve/main/random_forest_model.pkl"
 
     if not model_path.exists():
         urllib.request.urlretrieve(model_url, model_path)

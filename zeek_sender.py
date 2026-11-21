@@ -7,9 +7,8 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 LOG_FILE = PROJECT_DIR / "zeek-live" / "live" / "conn.log"
 
-API_URL = "http://127.0.0.1:8000"
-EMAIL = "nidsuser03@example.com"
-DEVICE_ID = 3
+API_URL = "https://aiml-multi-user-nids-1.onrender.com"
+EMAIL = input("Enter your registered email: ").strip()
 BATCH_SIZE = 10
 
 
@@ -18,12 +17,43 @@ def login():
     response = requests.post(
         f"{API_URL}/login",
         json={"email": EMAIL, "password": password},
-        timeout=10
+        timeout=60
     )
+    
     response.raise_for_status()
     print("Login successful!")
     return response.json()["access_token"]
 
+def get_device_id(token):
+    response = requests.get(
+        f"{API_URL}/devices",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10
+    )
+    response.raise_for_status()
+
+    devices = response.json()
+
+    if not devices:
+        raise RuntimeError("No registered devices found.")
+
+    active_devices = [d for d in devices if d["is_active"]]
+
+    if not active_devices:
+        raise RuntimeError("No active devices found.")
+
+    print("\nRegistered devices:")
+    for device in active_devices:
+        print(f'{device["id"]}: {device["device_name"]}')
+
+    if len(active_devices) == 1:
+        return active_devices[0]["id"]
+
+    selected_id = int(input("Enter your Device ID: "))
+    if not any(d["id"] == selected_id for d in active_devices):
+        raise ValueError("Invalid device ID.")
+
+    return selected_id
 
 def convert_value(value):
     return None if value in (None, "", "-") else value
@@ -58,11 +88,11 @@ def convert_record(record):
     }
 
 
-def send_batch(token, batch):
+def send_batch(token, device_id, batch):
     response = requests.post(
         f"{API_URL}/sensor/ingest",
         headers={"Authorization": f"Bearer {token}"},
-        json={"device_id": DEVICE_ID, "flows": batch},
+        json={"device_id": device_id, "flows": batch},
         timeout=20
     )
     response.raise_for_status()
@@ -75,6 +105,8 @@ def main():
         return
 
     token = login()
+    device_id = get_device_id(token)
+    print("Using Device ID:", device_id)
     print("Watching Zeek log:", LOG_FILE)
 
     with open(LOG_FILE, "r", encoding="utf-8") as file:
@@ -87,7 +119,7 @@ def main():
             if not line:
                 if batch:
                     try:
-                        send_batch(token, batch)
+                        send_batch(token, device_id, batch)
                         batch.clear()
                     except requests.RequestException as error:
                         print("API error:", error)
@@ -116,7 +148,7 @@ def main():
                 batch.append(convert_record(record))
 
                 if len(batch) >= BATCH_SIZE:
-                    send_batch(token, batch)
+                    send_batch(token, device_id, batch)
                     batch.clear()
 
             except (ValueError, KeyError) as error:
