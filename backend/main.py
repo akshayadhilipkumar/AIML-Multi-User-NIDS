@@ -277,7 +277,7 @@ def get_my_flows(
         .join(Device, NetworkFlow.device_id == Device.id)
         .filter(Device.user_id == current_user.id)
         .order_by(NetworkFlow.id.desc())
-        .limit(500)
+        .limit(5000)
         .all()
     )
 
@@ -291,6 +291,8 @@ def get_my_flows(
             "duration": flow.duration,
             "orig_bytes": flow.orig_bytes,
             "resp_bytes": flow.resp_bytes,
+            "orig_pkts": flow.orig_pkts,
+            "resp_pkts": flow.resp_pkts,
             "prediction": flow.prediction,
             "anomaly_score": flow.anomaly_score,
             "created_at": str(flow.created_at)

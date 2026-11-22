@@ -514,124 +514,82 @@ if page == "Live Monitoring":
         "Monitor Zeek connection records and score flows with the Zeek anomaly model",
     )
 
-    live_log = ROOT / "zeek-live" / "live" / "conn.log"
-    live_model_path = ROOT / "zeek_anomaly_model.pkl"
-
-    if not live_log.is_file():
-        st.error(f"Zeek log not found: {live_log}")
-        st.info(
-            "Start Zeek in Ubuntu WSL and configure its log directory to the project's zeek-live folder."
-        )
-        st.stop()
-
-    if not live_model_path.is_file():
-        st.error(f"Zeek anomaly model not found: {live_model_path}")
-        st.stop()
-
     st.button("Refresh live data")
+
     st.caption(
-        "Use the refresh button to reload the latest log records. Keep the Zeek capture terminal running while monitoring."
+        "Showing network flows received and stored by the NIDS backend."
     )
 
-    try:
-        zeek_artifact = joblib.load(live_model_path)
-        live_detector = zeek_artifact["pipeline"]
-        live_features = list(zeek_artifact["features"])
+    flows = fetch_my_flows()
 
-        fields = None
-        recent_rows = deque(maxlen=5000)
+    if not flows:
+        st.info("No network flow records available yet.")
+    else:
+        live_data = pd.DataFrame(flows)
 
-        with live_log.open("r", encoding="utf-8", errors="replace") as log_file:
-            for line in log_file:
-                if line.startswith("#fields"):
-                    fields = line.rstrip("\r\n").split("\t")[1:]
-                elif line.startswith("#") or not line.strip():
-                    continue
-                elif fields is not None:
-                    values = line.rstrip("\r\n").split("\t")
-                    if len(values) == len(fields):
-                        recent_rows.append(values)
+        if "prediction" not in live_data.columns:
+            live_data["prediction"] = "BASELINE"
 
-        if not fields:
-            st.warning("Zeek has not written a #fields header to conn.log yet.")
-            st.stop()
-
-        if not recent_rows:
-            st.info("Waiting for Zeek connection records. Generate ordinary network activity and refresh this page.")
-            st.stop()
-
-        live_data = pd.DataFrame(list(recent_rows), columns=fields)
-        missing_features = [
-            column for column in live_features if column not in live_data.columns
-        ]
-        if missing_features:
-            st.error(
-                "The current conn.log is missing model features: "
-                + ", ".join(missing_features)
-            )
-            st.caption(
-                "The Zeek conn.log fields must include the feature names used when training zeek_anomaly_model.pkl."
-            )
-            st.stop()
-
-        for column in live_features:
-            live_data[column] = pd.to_numeric(
-                live_data[column].replace("-", np.nan), errors="coerce"
-            )
-
-        usable = live_data[live_features].replace([np.inf, -np.inf], np.nan)
-        predictions = live_detector.predict(usable)
-        live_data["Anomaly Status"] = [
-            "Unusual flow" if value == -1 else "Baseline-like"
-            for value in predictions
-        ]
-        live_data["Model score"] = live_detector.decision_function(usable)
-
-        unusual_count = int((predictions == -1).sum())
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Flows analyzed", f"{len(live_data):,}")
-        c2.metric("Unusual flows", f"{unusual_count:,}")
-        c3.metric(
-            "Baseline-like flows", f"{len(live_data) - unusual_count:,}"
+        live_data["prediction"] = (
+            live_data["prediction"]
+            .fillna("BASELINE")
+            .astype(str)
+            .str.upper()
         )
 
+        unusual_mask = live_data["prediction"].str.contains(
+            "UNUSUAL", na=False
+        )
+
+        total_flows = len(live_data)
+        unusual_count = int(unusual_mask.sum())
+        baseline_count = total_flows - unusual_count
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Flows analyzed", f"{total_flows:,}")
+        c2.metric("Unusual flows", f"{unusual_count:,}")
+        c3.metric("Baseline flows", f"{baseline_count:,}")
+
         st.warning(
-            "Anomaly flags indicate unusual traffic, not confirmed attacks. "
-            "This view only covers traffic visible to the WSL Zeek interface."
+            "UNUSUAL indicates an AI anomaly flag, "
+            "not confirmation of a cyberattack."
         )
 
         st.subheader("Recent network flows")
-        st.markdown(
-            live_data.tail(100).to_html(
-                index=False, escape=True, classes="nids-table"
-            ),
-            unsafe_allow_html=True,
+        st.dataframe(
+            live_data.tail(100),
+            use_container_width=True,
+            hide_index=True
         )
 
-        flagged_live = live_data[
-            live_data["Anomaly Status"] == "Unusual flow"
-        ].sort_values("Model score")
         st.subheader("Unusual flows")
-        st.markdown(
-            flagged_live.head(100).to_html(
-                index=False, escape=True, classes="nids-table"
-            ),
-            unsafe_allow_html=True,
-        )
+        unusual_data = live_data[unusual_mask]
 
-        live_csv = live_data.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "Download live flow analysis (CSV)",
-            data=live_csv,
-            file_name="zeek_live_flow_analysis.csv",
-            mime="text/csv",
-        )
-    except Exception as exc:
-        st.error(f"Live monitoring error: {exc}")
-        if "SimpleImputer" in str(exc) or "_fill_dtype" in str(exc):
-            st.info("The Zeek model was saved with a different scikit-learn version. Retrain zeek_anomaly_model.pkl using the same Python environment that runs Streamlit.")
+        if not unusual_data.empty:
+            st.dataframe(
+                unusual_data.tail(100),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No unusual flows detected in these records.")
 
-    st.stop()
+    flagged_live = unusual_data.sort_values("anomaly_score", ascending=False)
+    st.subheader("Unusual flows")
+    st.markdown(
+        flagged_live.head(100).to_html(
+            index=False, escape=True, classes="nids-table"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    live_csv = live_data.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Download live flow analysis (CSV)",
+        data=live_csv,
+        file_name="zeek_live_flow_analysis.csv",
+        mime="text/csv",
+    )
 
 # The Zeek pages use their own model. The Random Forest and Isolation Forest
 # artifacts are required only for the CSV-analysis pages below.
