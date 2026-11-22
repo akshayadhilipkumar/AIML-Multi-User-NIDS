@@ -3,12 +3,20 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 # SQLite database file location
-DATABASE_URL = "sqlite:///./nids_database.db"
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nids_database.db")
 
 # Create database engine
+connect_args = (
+    {"check_same_thread": False}
+    if DATABASE_URL.startswith("sqlite")
+    else {}
+)
+
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False}
+    connect_args=connect_args
 )
 
 # Create database session

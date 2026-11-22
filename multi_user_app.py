@@ -111,7 +111,19 @@ def api_headers():
     return {
         "Authorization": f"Bearer {st.session_state.token}"
     }
+def fetch_my_flows():
+    try:
+        response = requests.get(
+            f"{API_URL}/my-flows",
+            headers=api_headers(),
+            timeout=20
+        )
+        response.raise_for_status()
+        return response.json()
 
+    except requests.RequestException as exc:
+        st.error(f"Unable to fetch network flows: {exc}")
+        return []
 
 
 # LOGIN AND REGISTRATION
