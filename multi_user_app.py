@@ -34,31 +34,43 @@ button[kind="primary"] { background:#2868db; }
 
 @st.cache_resource
 def load_artifacts():
-    import urllib.request
+    """Load models. Missing files are downloaded from the Hugging Face repo.
 
-    model_path = ROOT / "random_forest_model.pkl"
-    model_url = "https://huggingface.co/akshayaaa06/nids-random-forest-model/resolve/main/random_forest_model.pkl"
+    If the HF repo is private, add HF_TOKEN in Streamlit Cloud -> Settings -> Secrets.
+    """
+    from huggingface_hub import hf_hub_download
 
-    if not model_path.exists():
-        urllib.request.urlretrieve(model_url, model_path)
+    hf_repo = "akshayaaa06/nids-random-forest-model"
+    try:
+        hf_token = st.secrets.get("HF_TOKEN")
+    except Exception:
+        hf_token = None
 
-    isolation_path = ROOT / "isolation_forest_model.pkl"
-    preprocessor_path = ROOT / "preprocessor.pkl"
-
-    missing = [
-        str(p) for p in [isolation_path, preprocessor_path]
-        if not p.exists()
-    ]
-
-    if missing:
-        raise FileNotFoundError("Missing artifacts: " + ", ".join(missing))
+    paths = {}
+    for name in ("random_forest_model.pkl", "isolation_forest_model.pkl", "preprocessor.pkl"):
+        local = ROOT / name
+        if not local.exists():
+            try:
+                local = Path(
+                    hf_hub_download(
+                        repo_id=hf_repo,
+                        filename=name,
+                        token=hf_token,
+                        local_dir=str(ROOT),
+                    )
+                )
+            except Exception as exc:
+                raise FileNotFoundError(
+                    f"{name} not found locally and could not be downloaded from Hugging Face "
+                    f"({type(exc).__name__}). If the repo is private, set HF_TOKEN in Streamlit secrets."
+                ) from exc
+        paths[name] = local
 
     return (
-        joblib.load(model_path),
-        joblib.load(isolation_path),
-        joblib.load(preprocessor_path)
+        joblib.load(paths["random_forest_model.pkl"]),
+        joblib.load(paths["isolation_forest_model.pkl"]),
+        joblib.load(paths["preprocessor.pkl"]),
     )
-
 
 
 def prepare_features(frame, preprocessor):
@@ -111,18 +123,69 @@ def api_headers():
     return {
         "Authorization": f"Bearer {st.session_state.token}"
     }
+def session_expired():
+    st.session_state.token = None
+    st.warning("Your session expired. Please log in again.")
+    st.rerun()
+
+
 def fetch_my_flows():
     try:
         response = requests.get(
             f"{API_URL}/my-flows",
             headers=api_headers(),
-            timeout=20
+            timeout=60
         )
+        if response.status_code == 401:
+            session_expired()
         response.raise_for_status()
         return response.json()
 
     except requests.RequestException as exc:
         st.error(f"Unable to fetch network flows: {exc}")
+        return []
+
+
+def fetch_admin_flows():
+    try:
+        response = requests.get(
+            f"{API_URL}/admin/flows",
+            headers=api_headers(),
+            params={"limit": 5000},
+            timeout=60
+        )
+        if response.status_code == 401:
+            session_expired()
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        st.error(f"Unable to fetch lab flows: {exc}")
+        return []
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_is_admin(token):
+    try:
+        response = requests.get(
+            f"{API_URL}/me",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=60
+        )
+        return bool(response.ok and response.json().get("is_admin"))
+    except requests.RequestException:
+        return False
+
+
+def fetch_my_devices():
+    try:
+        response = requests.get(
+            f"{API_URL}/devices",
+            headers=api_headers(),
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException:
         return []
 
 
@@ -232,9 +295,7 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    page = st.radio(
-        "Navigation",
-        [
+    nav_pages = [
             "User Monitor",
             "Dashboard",
             "Alerts",
@@ -243,9 +304,10 @@ with st.sidebar:
             "Reports",
             "Zeek Flow Demo",
             "Live Monitoring",
-        ],
-        key="main_navigation",
-    )
+    ]
+    if fetch_is_admin(st.session_state.token):
+        nav_pages.insert(0, "Lab Overview")
+    page = st.radio("Navigation", nav_pages, key="main_navigation")
     st.divider()
     st.markdown("**Data source**")
     st.caption("User flows, uploaded CSV, saved Zeek logs, or live Zeek capture")
@@ -255,6 +317,66 @@ with st.sidebar:
         key="traffic_csv_upload",
         help="Used by Dashboard, Alerts, Traffic Monitor, Analysis, and Reports.",
     )
+
+
+if page == "Lab Overview":
+    section_header(
+        "Lab overview",
+        "Flows from every authorized device registered on this system (admin only)",
+    )
+
+    lab_a, lab_b = st.columns(2)
+    with lab_a:
+        lab_auto = st.toggle("Auto-refresh every 10s", value=True, key="lab_auto")
+    with lab_b:
+        st.button("Refresh now", key="lab_refresh")
+    if lab_auto:
+        st_autorefresh(interval=10000, key="lab_refresh_timer")
+
+    lab_flows = fetch_admin_flows()
+    if not lab_flows:
+        st.info("No flows yet from any device.")
+        st.stop()
+
+    lab_df = pd.DataFrame(lab_flows)
+    lab_df["prediction"] = lab_df["prediction"].fillna("BASELINE").astype(str).str.upper()
+    lab_df["owner / device"] = lab_df["username"].astype(str) + " / " + lab_df["device_name"].astype(str)
+
+    options = sorted(lab_df["owner / device"].unique())
+    picked = st.multiselect("Devices", options, default=options, key="lab_devices")
+    lab_df = lab_df[lab_df["owner / device"].isin(picked)]
+    lab_unusual = lab_df["prediction"].str.contains("UNUSUAL", na=False)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Flows", f"{len(lab_df):,}")
+    k2.metric("Unusual flows", f"{int(lab_unusual.sum()):,}")
+    k3.metric("Devices reporting", lab_df["owner / device"].nunique())
+    k4.metric("Users", lab_df["username"].nunique())
+    st.warning("UNUSUAL is an AI anomaly flag, not confirmation of a cyberattack.")
+
+    st.subheader("Per-device summary")
+    lab_summary = (
+        lab_df.assign(unusual=lab_unusual)
+        .groupby("owner / device", as_index=False)
+        .agg(flows=("prediction", "size"), unusual=("unusual", "sum"), last_seen=("created_at", "max"))
+    )
+    st.dataframe(lab_summary, use_container_width=True, hide_index=True)
+
+    st.subheader("Flows per device")
+    fig = px.bar(lab_summary, x="owner / device", y=["flows", "unusual"], barmode="group")
+    fig.update_layout(template="plotly_dark", legend_title_text="")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Recent unusual flows (all devices)")
+    lab_flagged = lab_df[lab_unusual]
+    if lab_flagged.empty:
+        st.info("No unusual flows in the selected devices.")
+    else:
+        st.dataframe(lab_flagged.head(100), use_container_width=True, hide_index=True)
+
+    st.subheader("Recent flows (all devices)")
+    st.dataframe(lab_df.head(100), use_container_width=True, hide_index=True)
+    st.stop()
 
 
 if page == "User Monitor":
@@ -396,7 +518,7 @@ if page == "Zeek Flow Demo":
     )
 elif page == "Live Monitoring":
     st.caption(
-        "Reads Zeek conn.log written by the WSL capture process. It only covers traffic visible to the WSL interface."
+        "Shows flows sent by authorized Zeek sensors. Each sensor only reports traffic visible on its own machine/interface."
     )
 else:
     st.caption("Predictions are generated from the uploaded traffic CSV.")
@@ -511,85 +633,88 @@ if page == "Zeek Flow Demo":
 if page == "Live Monitoring":
     section_header(
         "Live Network Monitoring",
-        "Monitor Zeek connection records and score flows with the Zeek anomaly model",
+        "Flows sent by authorized Zeek sensors and scored by the NIDS backend",
     )
 
-    st.button("Refresh live data")
+    ctl_a, ctl_b = st.columns([1, 1])
+    with ctl_a:
+        auto_refresh = st.toggle("Auto-refresh every 10s", value=True)
+    with ctl_b:
+        st.button("Refresh now")
+    if auto_refresh:
+        st_autorefresh(interval=10000, key="live_monitor_refresh")
 
-    st.caption(
-        "Showing network flows received and stored by the NIDS backend."
-    )
-
+    devices = fetch_my_devices()
+    device_names = {d["id"]: d.get("device_name", f"Device {d['id']}") for d in devices}
     flows = fetch_my_flows()
 
     if not flows:
-        st.info("No network flow records available yet.")
+        st.info(
+            "No flow records yet. Start Zeek and zeek_sender.py on an authorized device, "
+            "then wait a few seconds."
+        )
+        st.stop()
+
+    live_data = pd.DataFrame(flows)
+    if "prediction" not in live_data.columns:
+        live_data["prediction"] = "BASELINE"
+    live_data["prediction"] = live_data["prediction"].fillna("BASELINE").astype(str).str.upper()
+
+    if "device_id" in live_data.columns:
+        live_data["device"] = live_data["device_id"].map(device_names).fillna(
+            live_data["device_id"].astype(str)
+        )
     else:
-        live_data = pd.DataFrame(flows)
+        live_data["device"] = "unknown"
 
-        if "prediction" not in live_data.columns:
-            live_data["prediction"] = "BASELINE"
+    all_devices = sorted(live_data["device"].unique())
+    chosen = st.multiselect("Devices", all_devices, default=all_devices)
+    live_data = live_data[live_data["device"].isin(chosen)]
+    if "id" in live_data.columns:
+        live_data = live_data.sort_values("id", ascending=False)
 
-        live_data["prediction"] = (
-            live_data["prediction"]
-            .fillna("BASELINE")
-            .astype(str)
-            .str.upper()
-        )
+    unusual_mask = live_data["prediction"].str.contains("UNUSUAL", na=False)
+    total_flows = len(live_data)
+    unusual_count = int(unusual_mask.sum())
 
-        unusual_mask = live_data["prediction"].str.contains(
-            "UNUSUAL", na=False
-        )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Flows analyzed", f"{total_flows:,}")
+    c2.metric("Unusual flows", f"{unusual_count:,}")
+    c3.metric("Baseline flows", f"{total_flows - unusual_count:,}")
+    c4.metric("Active devices", live_data["device"].nunique())
 
-        total_flows = len(live_data)
-        unusual_count = int(unusual_mask.sum())
-        baseline_count = total_flows - unusual_count
+    st.warning("UNUSUAL is an AI anomaly flag, not confirmation of a cyberattack.")
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Flows analyzed", f"{total_flows:,}")
-        c2.metric("Unusual flows", f"{unusual_count:,}")
-        c3.metric("Baseline flows", f"{baseline_count:,}")
-
-        st.warning(
-            "UNUSUAL indicates an AI anomaly flag, "
-            "not confirmation of a cyberattack."
-        )
-
-        st.subheader("Recent network flows")
-        st.dataframe(
-            live_data.tail(100),
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.subheader("Unusual flows")
-        unusual_data = live_data[unusual_mask]
-
-        if not unusual_data.empty:
-            st.dataframe(
-                unusual_data.tail(100),
-                use_container_width=True,
-                hide_index=True
-            )
-        else:
-            st.info("No unusual flows detected in these records.")
-
-    flagged_live = unusual_data.sort_values("anomaly_score", ascending=False)
-    st.subheader("Unusual flows")
-    st.markdown(
-        flagged_live.head(100).to_html(
-            index=False, escape=True, classes="nids-table"
-        ),
-        unsafe_allow_html=True,
+    st.subheader("Per-device summary")
+    summary = (
+        live_data.assign(unusual=unusual_mask)
+        .groupby("device", as_index=False)
+        .agg(flows=("prediction", "size"), unusual=("unusual", "sum"))
     )
+    if "created_at" in live_data.columns:
+        last_seen = live_data.groupby("device")["created_at"].max().rename("last_seen")
+        summary = summary.merge(last_seen, on="device", how="left")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    live_csv = live_data.to_csv(index=False).encode("utf-8-sig")
+    st.subheader("Recent network flows")
+    st.dataframe(live_data.head(100), use_container_width=True, hide_index=True)
+
+    st.subheader("Unusual flows")
+    unusual_data = live_data[unusual_mask]
+    if unusual_data.empty:
+        st.info("No unusual flows detected in these records.")
+    else:
+        if "anomaly_score" in unusual_data.columns:
+            unusual_data = unusual_data.sort_values("anomaly_score", ascending=False)
+        st.dataframe(unusual_data.head(100), use_container_width=True, hide_index=True)
+
     st.download_button(
         "Download live flow analysis (CSV)",
-        data=live_csv,
+        data=live_data.to_csv(index=False).encode("utf-8-sig"),
         file_name="zeek_live_flow_analysis.csv",
         mime="text/csv",
     )
+    st.stop()
 
 # The Zeek pages use their own model. The Random Forest and Isolation Forest
 # artifacts are required only for the CSV-analysis pages below.
